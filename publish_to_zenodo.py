@@ -54,7 +54,10 @@ RSV_MESH_SUBJECT = {
     "identifier": "http://id.nlm.nih.gov/mesh/D018357",
     "scheme": "url",
 }
-OBSOLETE_RELEASE_FILES = {"rsv-smh-generated-output.tar.gz"}
+OBSOLETE_RELEASE_FILES = {"rsv-smh-generated-output.tar.gz", "README.md"}
+COMBINED_RECORD_TITLE = "RSV Scenario Modeling Hub data and JSON-LD metadata, 2023–2026"
+SPLIT_MANIFEST_NAME = "sandbox-split.json"
+SPLIT_MANIFEST_SCHEMA_VERSION = "1.0"
 LICENSE_IDS = {
     "bsd simplified": "bsd-2-clause",
     "cc-by-4.0": "cc-by-4.0",
@@ -293,6 +296,7 @@ def build_release(
     include_source_data: bool = True,
     include_generated_output: bool = True,
     reuse_archives: bool = False,
+    extra_provenance: dict[str, Any] | None = None,
 ) -> list[Path]:
     """Create self-contained round archives, rights metadata, and checksums."""
     selected_rounds = tuple(rounds)
@@ -351,7 +355,11 @@ def build_release(
     license_manifest = build_license_manifest(repository_root, selected_rounds)
     source_snapshots = _load_source_snapshots(repository_root, selected_rounds)
 
-    readme_path = release_dir / "README.md"
+    # Zenodo serves .md as an octet-stream attachment, so a browser downloads it
+    # instead of showing it. .txt is served inline, so the readme is actually
+    # readable from the record page. It is a loose file only; no tarball holds it.
+    (release_dir / "README.md").unlink(missing_ok=True)
+    readme_path = release_dir / "README.txt"
     readme_path.write_text(
         _build_release_readme(selected_rounds, license_manifest, source_snapshots),
         encoding="utf-8",
@@ -376,15 +384,19 @@ def build_release(
         "source_repository": SOURCE_REPOSITORY,
         "source_snapshots": source_snapshots,
         "rounds": list(selected_rounds),
+        # Every uploaded payload file is hashed here except SHA256SUMS and this
+        # file, neither of which can contain its own digest.
         "artifacts": [
             {
                 "name": path.name,
                 "bytes": path.stat().st_size,
                 "sha256": _file_digest(path, "sha256"),
             }
-            for path in artifacts
+            for path in (*artifacts, *loose_outputs, readme_path, licenses_path)
         ],
     }
+    if extra_provenance:
+        provenance.update(extra_provenance)
     provenance_path.write_text(
         json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -482,6 +494,28 @@ def _load_source_snapshots(
             raise ValueError(f"Source provenance is incomplete: {path}")
         snapshots.append({"round_id": round_id, **snapshot})
     return snapshots
+
+
+def derive_record_title(round_name: str) -> str:
+    """Title a single-round record round-first, using the hub's official name."""
+    return (
+        f"{round_name}: RSV Scenario Modeling Hub scenario projections "
+        "and JSON-LD metadata"
+    )
+
+
+def derive_record_version(repository_root: Path, rounds: Iterable[str]) -> str:
+    """Version a single-round record from its upstream tag plus the parser release.
+
+    The source ref alone is not enough: regenerating a record with a newer parser
+    changes its content while the upstream ref stays fixed, so two materially
+    different records would claim the same version. Pairing both keeps the value
+    unique per (source, parser) combination.
+    """
+    snapshots = _load_source_snapshots(repository_root, rounds)
+    if len(snapshots) != 1:
+        return datetime.now(UTC).date().strftime("%Y.%m.%d")
+    return f"{snapshots[0]['ref']}+parser.{PARSER_RELEASE_TAG}"
 
 
 def _build_release_readme(
@@ -679,6 +713,43 @@ def publish_existing_draft(client: ZenodoClient, deposition_id: int) -> dict[str
     }
 
 
+def update_draft_metadata_only(
+    client: ZenodoClient,
+    deposition_id: int,
+    *,
+    metadata: dict[str, Any],
+    record_license_ids: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Update a draft's metadata without touching any of its files.
+
+    Deliberately separate from update_existing_draft(), which uploads new files and
+    deletes obsolete ones. Metadata-only edits (sibling links, corrected titles)
+    must never put an uploaded payload at risk.
+
+    Ordering matters: the legacy deposition API is applied first, then the native
+    record API adds the mixed-license list and copyright statement. The legacy
+    serializer carries only one license, so applying it after the native call would
+    erase the native rights and copyright fields.
+    """
+    updated = client.update_deposition(deposition_id, metadata)
+    if metadata.get("copyright") or record_license_ids is not None:
+        client.enrich_draft_metadata(
+            deposition_id,
+            rights=(
+                record_license_ids
+                if record_license_ids is not None
+                else (str(metadata.get("license") or ""),)
+            ),
+            copyright_statement=metadata.get("copyright"),
+        )
+    links = updated.get("links", {})
+    return {
+        "deposition_id": deposition_id,
+        "published": False,
+        "url": links.get("html") or links.get("self"),
+    }
+
+
 def update_existing_draft(
     client: ZenodoClient,
     deposition_id: int,
@@ -767,14 +838,23 @@ def build_metadata(
         f"{_display_round_name(item['name'])} (origin {item['round_id']})"
         for item in internal["rounds"]
     )
+    single_round = len(internal["rounds"]) == 1
+    coverage = (
+        f"<p>This record covers {round_labels} and contains "
+        f"{internal['model_round_count']} model-round datasets.</p>"
+        if single_round
+        else (
+            f"<p>It covers {len(internal['rounds'])} rounds and "
+            f"{internal['model_round_count']} model-round datasets: {round_labels}.</p>"
+        )
+    )
     description = args.description or (
         "<p>This dataset contains conditional long-term respiratory syncytial "
         "virus (RSV) scenario projections submitted to the Scenario Modeling "
         "Hub, together with model metadata and generated JSON-LD and HTML "
         "representations. The scenarios compare possible trajectories under "
         "specified assumptions; they are not unconditional forecasts.</p>"
-        f"<p>It covers {len(internal['rounds'])} rounds and "
-        f"{internal['model_round_count']} model-round datasets: {round_labels}.</p>"
+        f"{coverage}"
         "<p>Each round archive is self-contained and includes Hubverse "
         "configuration, model metadata, Apache Parquet model outputs, per-model "
         "JSON-LD, and consolidated round-level JSON-LD and HTML. Outputs cover "
@@ -783,8 +863,20 @@ def build_metadata(
         "trajectories, and—where submitted—quantiles and derived targets.</p>"
     )
     subjects = [RSV_MESH_SUBJECT, *internal["subjects"]]
+    # A single-round record is titled and versioned from that round; the combined
+    # record keeps the span title and a date-stamped version.
+    title = args.title or (
+        derive_record_title(_display_round_name(internal["rounds"][0]["name"]))
+        if single_round
+        else COMBINED_RECORD_TITLE
+    )
+    version = args.version or (
+        derive_record_version(repository_root, selected_rounds)
+        if single_round
+        else datetime.now(UTC).date().strftime("%Y.%m.%d")
+    )
     metadata: dict[str, Any] = {
-        "title": args.title,
+        "title": title,
         "upload_type": "dataset",
         "description": description,
         "copyright": DATASET_COPYRIGHT,
@@ -792,7 +884,7 @@ def build_metadata(
         "license": args.license,
         "creators": creators,
         "contributors": internal["contributors"],
-        "version": args.version,
+        "version": version,
         "keywords": [
             "respiratory syncytial virus",
             "Respiratory Syncytial Virus Infections",
@@ -1037,6 +1129,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reuse existing non-empty archives instead of rebuilding them.",
     )
     parser.add_argument(
+        "--split-by-round",
+        action="store_true",
+        help=(
+            "Create one unpublished draft per round instead of a single combined "
+            "record. Never publishes and never reserves a DOI."
+        ),
+    )
+    parser.add_argument(
         "--skip-source-data",
         action="store_true",
         help="Do not package the source Parquet/configuration data.",
@@ -1048,7 +1148,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--title",
-        default="RSV Scenario Modeling Hub data and JSON-LD metadata, 2023–2026",
+        default=None,
+        help=(
+            "Record title. Defaults to a round-first title for a single round, "
+            f"or {COMBINED_RECORD_TITLE!r} for a combined record."
+        ),
     )
     parser.add_argument(
         "--description",
@@ -1060,7 +1164,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Creator name; repeat to preserve Zenodo creator order.",
     )
     parser.add_argument(
-        "--version", default=datetime.now(UTC).date().strftime("%Y.%m.%d")
+        "--version",
+        default=None,
+        help=(
+            "Record version. Defaults to '<source-tag>+parser.<parser-tag>' for a "
+            "single round, or today's date for a combined record."
+        ),
     )
     parser.add_argument(
         "--license",
@@ -1126,6 +1235,259 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _web_url_for(api_url: str) -> str:
+    """Derive the web host from the API URL so record links follow --api-url."""
+    parsed = urlparse(api_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Cannot derive a web URL from api_url: {api_url!r}")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def assert_no_reserved_doi(deposition: dict[str, Any]) -> None:
+    """Fail if a draft carries a real DOI.
+
+    Only the native ``pids.doi`` and the top-level ``doi`` are trusted. The legacy
+    serializer's ``metadata.prereserve_doi`` is synthetic: it reports a production
+    prefix (10.5281) for Sandbox drafts that have reserved nothing, so treating it
+    as evidence of a DOI would make this check fail on every draft.
+    """
+    pids = deposition.get("pids")
+    if isinstance(pids, dict):
+        doi_pid = pids.get("doi")
+        if isinstance(doi_pid, dict) and doi_pid.get("identifier"):
+            raise ZenodoError(
+                f"Draft {deposition.get('id')} unexpectedly carries DOI "
+                f"{doi_pid['identifier']}; split mode must not reserve DOIs."
+            )
+    if deposition.get("doi"):
+        raise ZenodoError(
+            f"Draft {deposition.get('id')} unexpectedly carries DOI "
+            f"{deposition['doi']}; split mode must not reserve DOIs."
+        )
+
+
+def load_split_manifest(path: Path, *, api_url: str) -> dict[str, Any]:
+    """Load a split manifest, refusing one written against another Zenodo host."""
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Split manifest must contain a JSON object: {path}")
+    recorded = str(manifest.get("api_url") or "")
+    if recorded != api_url:
+        raise ValueError(
+            f"Split manifest {path} was written for {recorded or '<unset>'}, "
+            f"not {api_url}. Refusing to resume against a different host."
+        )
+    return manifest
+
+
+def _write_split_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    """Persist progress. Called after every remote operation so a crash resumes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def split_release_by_round(
+    client: ZenodoClient | None,
+    args: argparse.Namespace,
+    rounds: Iterable[str],
+    repository_root: Path,
+) -> dict[str, Any]:
+    """Create or resume one Sandbox draft per round. Never publishes.
+
+    Drafts are created first so every deposition id is known before any release
+    directory is built; sibling record URLs are recorded in the manifest and in
+    each round's release_metadata.json, but deliberately not written into record
+    metadata while the records are drafts (those URLs 404 until publication).
+    """
+    selected_rounds = tuple(rounds)
+    release_root = args.release_dir.resolve()
+    api_url = args.api_url
+    web_url = _web_url_for(api_url)
+    manifest_path = release_root / SPLIT_MANIFEST_NAME
+
+    # Validate every round locally before any network call, so a bad round fails
+    # the whole run before partial drafts exist.
+    per_round_metadata: dict[str, dict[str, Any]] = {}
+    per_round_licenses: dict[str, list[str]] = {}
+    for round_id in selected_rounds:
+        per_round_metadata[round_id] = build_metadata(
+            args, (round_id,), repository_root
+        )
+        per_round_licenses[round_id] = build_license_manifest(
+            repository_root, (round_id,)
+        )["record_level_licenses"]
+
+    if args.dry_run:
+        results = []
+        for round_id in selected_rounds:
+            files = build_release(
+                repository_root=repository_root,
+                release_dir=release_root / round_id,
+                rounds=(round_id,),
+                include_source_data=not args.skip_source_data,
+                include_generated_output=not args.skip_generated_output,
+                reuse_archives=args.reuse_archives,
+            )
+            results.append(
+                {
+                    "round_id": round_id,
+                    "title": per_round_metadata[round_id]["title"],
+                    "version": per_round_metadata[round_id]["version"],
+                    "release_dir": str(release_root / round_id),
+                    "files": [path.name for path in files],
+                }
+            )
+        return {
+            "dry_run": True,
+            "split_by_round": True,
+            "environment": "zenodo-sandbox",
+            "api_url": api_url,
+            "web_url": web_url,
+            "rounds": results,
+        }
+
+    if manifest_path.is_file():
+        manifest = load_split_manifest(manifest_path, api_url=api_url)
+        recorded_commit = str(manifest.get("repository_commit") or "")
+        current_commit = _git_value(repository_root, "rev-parse", "HEAD") or ""
+        if recorded_commit and current_commit and recorded_commit != current_commit:
+            print(
+                f"Warning: split manifest was written at {recorded_commit[:8]} but "
+                f"HEAD is {current_commit[:8]}; uploaded content may differ.",
+                file=sys.stderr,
+            )
+    else:
+        manifest = {
+            "schema_version": SPLIT_MANIFEST_SCHEMA_VERSION,
+            "environment": "zenodo-sandbox",
+            "api_url": api_url,
+            "web_url": web_url,
+            "repository_commit": _git_value(repository_root, "rev-parse", "HEAD"),
+            "created_at": datetime.now(UTC).isoformat(),
+            "rounds": {},
+        }
+
+    assert client is not None
+    entries: dict[str, dict[str, Any]] = manifest.setdefault("rounds", {})
+
+    # Phase 1 - every draft exists and its id is persisted before anything is built.
+    for round_id in selected_rounds:
+        entry = entries.get(round_id) or {}
+        deposition_id = entry.get("deposition_id")
+        if deposition_id:
+            existing = client.get_deposition(int(deposition_id))
+            if existing.get("submitted"):
+                raise ZenodoError(
+                    f"Draft {deposition_id} for round {round_id} is already "
+                    "published; refusing to modify it."
+                )
+            assert_no_reserved_doi(existing)
+        else:
+            created = client.create_deposition(per_round_metadata[round_id])
+            try:
+                deposition_id = int(created["id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ZenodoError(
+                    f"Zenodo did not return an ID for the {round_id} draft."
+                ) from exc
+            assert_no_reserved_doi(created)
+            entry = {
+                "deposition_id": deposition_id,
+                "draft_url": f"{web_url}/uploads/{deposition_id}",
+                "future_record_url": f"{web_url}/records/{deposition_id}",
+                "doi": None,
+                "release_dir": str(release_root / round_id),
+                "status": "created",
+            }
+            entries[round_id] = entry
+            _write_split_manifest(manifest_path, manifest)
+
+    # Phase 2 - sibling URLs are known only once every draft exists.
+    for round_id in selected_rounds:
+        entries[round_id]["sibling_record_urls"] = [
+            entries[other]["future_record_url"]
+            for other in selected_rounds
+            if other != round_id
+        ]
+    _write_split_manifest(manifest_path, manifest)
+
+    # Phase 3 - build, upload, verify, one round at a time.
+    for round_id in selected_rounds:
+        entry = entries[round_id]
+        deposition_id = int(entry["deposition_id"])
+        release_files = build_release(
+            repository_root=repository_root,
+            release_dir=release_root / round_id,
+            rounds=(round_id,),
+            include_source_data=not args.skip_source_data,
+            include_generated_output=not args.skip_generated_output,
+            reuse_archives=args.reuse_archives,
+            extra_provenance={
+                "environment": "zenodo-sandbox",
+                "api_url": api_url,
+                "web_url": web_url,
+                "deposition_id": deposition_id,
+                "future_record_url": entry["future_record_url"],
+                "sibling_record_urls": entry["sibling_record_urls"],
+                "doi": None,
+            },
+        )
+        update_draft_metadata_only(
+            client,
+            deposition_id,
+            metadata=per_round_metadata[round_id],
+            record_license_ids=per_round_licenses[round_id],
+        )
+        deposition = client.get_deposition(deposition_id)
+        bucket_url = (deposition.get("links") or {}).get("bucket")
+        if not isinstance(bucket_url, str):
+            raise ZenodoError(f"No bucket URL for draft {deposition_id}.")
+        remote = {
+            item.get("filename"): item for item in deposition.get("files") or []
+        }
+        for path in release_files:
+            existing = remote.get(path.name)
+            if existing and _file_digest(path, "md5") == str(
+                existing.get("checksum") or ""
+            ).removeprefix("md5:"):
+                continue
+            client.upload_file(bucket_url, path)
+        entry["status"] = "uploaded"
+        entry["files"] = [path.name for path in release_files]
+        _write_split_manifest(manifest_path, manifest)
+
+        final = client.get_deposition(deposition_id)
+        assert_no_reserved_doi(final)
+        uploaded_names = {item.get("filename") for item in final.get("files") or []}
+        missing = [path.name for path in release_files if path.name not in uploaded_names]
+        if missing:
+            raise ZenodoError(
+                f"Draft {deposition_id} is missing uploaded files: {', '.join(missing)}"
+            )
+        entry["status"] = "verified"
+        _write_split_manifest(manifest_path, manifest)
+
+    return {
+        "split_by_round": True,
+        "published": False,
+        "environment": "zenodo-sandbox",
+        "api_url": api_url,
+        "web_url": web_url,
+        "manifest": str(manifest_path),
+        "rounds": [
+            {
+                "round_id": round_id,
+                "deposition_id": entries[round_id]["deposition_id"],
+                "title": per_round_metadata[round_id]["title"],
+                "draft_url": entries[round_id]["draft_url"],
+                "future_record_url": entries[round_id]["future_record_url"],
+                "status": entries[round_id]["status"],
+            }
+            for round_id in selected_rounds
+        ],
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1142,6 +1504,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     if not args.dry_run and not os.getenv(args.token_env):
         parser.error(f"Set {args.token_env} before contacting Zenodo Sandbox.")
+
+    if args.split_by_round:
+        # Split mode creates several drafts at once, so any flag that targets or
+        # publishes a single record is ambiguous or forbidden rather than ignored.
+        for flag, value in (
+            ("--publish", args.publish),
+            ("--publish-draft", args.publish_draft),
+            ("--update-draft", args.update_draft),
+        ):
+            if value:
+                parser.error(f"{flag} cannot be combined with --split-by-round.")
+        if args.metadata_file:
+            parser.error(
+                "--metadata-file cannot be combined with --split-by-round; it has "
+                "no per-round schema yet."
+            )
 
     if args.publish_draft:
         try:
@@ -1161,6 +1539,36 @@ def main(argv: list[str] | None = None) -> int:
     rounds = tuple(args.rounds or discover_rounds(REPOSITORY_ROOT))
     if not rounds:
         parser.error("No data round directories were found.")
+
+    if args.split_by_round:
+        if args.title and len(rounds) > 1:
+            parser.error(
+                "--title cannot be combined with --split-by-round across multiple "
+                "rounds; one title cannot serve several records."
+            )
+        try:
+            client = (
+                None
+                if args.dry_run
+                else ZenodoClient(
+                    os.environ[args.token_env],
+                    api_url=args.api_url,
+                    timeout=args.timeout,
+                )
+            )
+            result = split_release_by_round(client, args, rounds, REPOSITORY_ROOT)
+        except (OSError, requests.RequestException, ValueError, ZenodoError) as exc:
+            print(f"Zenodo split release failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        if args.dry_run:
+            print("Dry run complete; Zenodo was not contacted.", file=sys.stderr)
+        else:
+            print(
+                f"{len(rounds)} Sandbox drafts created or updated; none published.",
+                file=sys.stderr,
+            )
+        return 0
 
     try:
         metadata = build_metadata(args, rounds, REPOSITORY_ROOT)
@@ -1336,10 +1744,14 @@ def _zenodo_license_id(value: str) -> str:
 
 
 def _display_round_name(value: Any) -> str:
-    """Use season-oriented labels when every annual round is internally Round 1."""
+    """Return the hub's official round name, e.g. "Round 1 - 2025-2026".
+
+    RSV SMH restarts round numbering each season, so every season's first round is
+    officially "Round 1 - <season>"; only internal_round_name increments across
+    seasons. An earlier version stripped the "Round 1 - " prefix on the assumption
+    that it was redundant, which discarded the official name the hub publishes.
+    """
     name = _clean_text(value)
-    if name.casefold().startswith("round 1 - "):
-        name = name[len("Round 1 - ") :]
     suffix = " Scenario Projection Models Collection"
     name = name.removesuffix(suffix)
     return name or "Scenario round"

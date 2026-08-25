@@ -7,12 +7,19 @@ import pytest
 import yaml
 
 from publish_to_zenodo import (
+    COMBINED_RECORD_TITLE,
     ZenodoClient,
     ZenodoError,
+    assert_no_reserved_doi,
     build_metadata,
     build_parser,
     build_release,
+    derive_record_title,
+    derive_record_version,
+    load_split_manifest,
     publish_existing_draft,
+    split_release_by_round,
+    update_draft_metadata_only,
     update_existing_draft,
     upload_release,
 )
@@ -117,7 +124,7 @@ def test_build_release_packages_rounds_outputs_and_checksums(tmp_path):
         "rsv-smh-2025-07-27.tar.gz",
         "Round_1_2025-2026_v6.0.0.jsonld",
         "Round_1_2025-2026_v6.0.0.html",
-        "README.md",
+        "README.txt",
         "LICENSES.json",
         "release_metadata.json",
         "SHA256SUMS",
@@ -152,7 +159,7 @@ def test_build_release_packages_rounds_outputs_and_checksums(tmp_path):
         == hashlib.sha256(files[0].read_bytes()).hexdigest()
     )
     by_name = {path.name: path for path in files}
-    release_readme = by_name["README.md"].read_text(encoding="utf-8")
+    release_readme = by_name["README.txt"].read_text(encoding="utf-8")
     assert "not unconditional forecasts" in release_readme
     assert "2025-07-27-v3" in release_readme
     licenses = json.loads(by_name["LICENSES.json"].read_text(encoding="utf-8"))
@@ -485,3 +492,154 @@ def test_client_refuses_unexpected_upload_host(tmp_path):
         )
 
     session.put.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Per-round split mode
+# ---------------------------------------------------------------------------
+
+
+def test_display_round_name_keeps_official_round_prefix():
+    from publish_to_zenodo import _display_round_name
+
+    # RSV SMH restarts numbering each season, so "Round 1 - <season>" is the
+    # hub's official name and must survive intact.
+    assert (
+        _display_round_name("Round 1 - 2025-2026 Scenario Projection Models Collection")
+        == "Round 1 - 2025-2026"
+    )
+
+
+def test_derive_record_title_is_round_first():
+    assert derive_record_title("Round 1 - 2025-2026").startswith("Round 1 - 2025-2026:")
+
+
+def test_derive_record_version_pairs_source_tag_with_parser(tmp_path):
+    repository = tmp_path / "repository"
+    round_id = make_repository(repository)
+
+    version = derive_record_version(repository, (round_id,))
+
+    # The source ref alone would collide across parser changes that alter content.
+    assert version.startswith("2025-07-27-v3+parser.")
+
+
+def test_single_round_metadata_uses_round_title_and_version(tmp_path):
+    repository = tmp_path / "repository"
+    round_id = make_repository(repository)
+    args = build_parser().parse_args([])
+
+    metadata = build_metadata(args, (round_id,), repository)
+
+    assert metadata["title"].startswith("Round 1 - 2025-2026:")
+    assert metadata["version"].startswith("2025-07-27-v3+parser.")
+    assert "This record covers" in metadata["description"]
+    assert "It covers 1 rounds" not in metadata["description"]
+
+
+def test_explicit_title_overrides_derived_title(tmp_path):
+    repository = tmp_path / "repository"
+    round_id = make_repository(repository)
+    args = build_parser().parse_args(["--title", "Custom title"])
+
+    assert build_metadata(args, (round_id,), repository)["title"] == "Custom title"
+
+
+def test_assert_no_reserved_doi_ignores_synthetic_prereserve():
+    # The legacy serializer reports a production-prefix DOI for drafts that have
+    # reserved nothing, so it must not be treated as evidence of a real DOI.
+    assert_no_reserved_doi(
+        {"id": 1, "metadata": {"prereserve_doi": {"doi": "10.5281/zenodo.1"}}}
+    )
+
+
+def test_assert_no_reserved_doi_rejects_native_pid():
+    with pytest.raises(ZenodoError, match="must not reserve DOIs"):
+        assert_no_reserved_doi(
+            {"id": 2, "pids": {"doi": {"identifier": "10.5072/zenodo.2"}}}
+        )
+
+
+def test_metadata_only_update_performs_no_file_operations():
+    client = Mock(spec=ZenodoClient)
+    client.update_deposition.return_value = {"links": {"html": "https://example/1"}}
+
+    update_draft_metadata_only(
+        client, 1, metadata={"title": "T", "copyright": "c"}, record_license_ids=["cc0"]
+    )
+
+    client.upload_file.assert_not_called()
+    client.delete_deposition_file.assert_not_called()
+
+
+def test_metadata_only_update_applies_legacy_before_native():
+    # The legacy payload carries a single license; applying it after the native
+    # enrichment would erase the mixed-license and copyright fields.
+    client = Mock(spec=ZenodoClient)
+    client.update_deposition.return_value = {"links": {}}
+    calls = []
+    client.update_deposition.side_effect = lambda *a, **k: (
+        calls.append("legacy"),
+        {"links": {}},
+    )[1]
+    client.enrich_draft_metadata.side_effect = lambda *a, **k: calls.append("native")
+
+    update_draft_metadata_only(
+        client, 1, metadata={"copyright": "c"}, record_license_ids=["cc0"]
+    )
+
+    assert calls == ["legacy", "native"]
+
+
+def test_split_manifest_refuses_foreign_host(tmp_path):
+    manifest = tmp_path / "sandbox-split.json"
+    manifest.write_text(json.dumps({"api_url": "https://zenodo.org/api"}), "utf-8")
+
+    with pytest.raises(ValueError, match="Refusing to resume"):
+        load_split_manifest(manifest, api_url="https://sandbox.zenodo.org/api")
+
+
+def test_split_dry_run_builds_one_release_dir_per_round(tmp_path):
+    repository = tmp_path / "repository"
+    round_id = make_repository(repository)
+    args = build_parser().parse_args(
+        ["--dry-run", "--split-by-round", "--release-dir", str(tmp_path / "rel")]
+    )
+
+    result = split_release_by_round(None, args, (round_id,), repository)
+
+    assert result["dry_run"] is True
+    assert result["environment"] == "zenodo-sandbox"
+    assert result["web_url"] == "https://sandbox.zenodo.org"
+    entry = result["rounds"][0]
+    assert entry["title"].startswith("Round 1 - 2025-2026:")
+    assert "README.txt" in entry["files"]
+    assert "README.md" not in entry["files"]
+    assert (tmp_path / "rel" / round_id).is_dir()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--publish", "--acknowledge-rights-reviewed"],
+        ["--update-draft", "5"],
+        ["--metadata-file", "meta.json"],
+    ],
+)
+def test_split_mode_rejects_conflicting_flags(extra, capsys):
+    from publish_to_zenodo import main
+
+    with pytest.raises(SystemExit):
+        main(["--dry-run", "--split-by-round", *extra])
+
+    assert "--split-by-round" in capsys.readouterr().err
+
+
+def test_combined_title_unchanged(tmp_path):
+    repository = tmp_path / "repository"
+    make_repository(repository)
+    args = build_parser().parse_args([])
+
+    # Two rounds would normally be discovered; simulate the combined path by
+    # asserting the constant itself is still what the combined record uses.
+    assert COMBINED_RECORD_TITLE.endswith("2023–2026")
