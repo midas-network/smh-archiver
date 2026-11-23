@@ -7,6 +7,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from pipeline.jsonld_to_html import (
+    ELLIPSIS_DISPLAY,
+    MISSING_DISPLAY,
+    generate_abstract_section,
+    generate_cover_section,
+    generate_header_section,
     generate_output_type_metadata_html,
     generate_output_types_section,
     get_first_n_rows_of_output,
@@ -42,7 +47,37 @@ def test_get_first_n_rows_reads_parquet(monkeypatch, tmp_path):
     assert "<table" in html
     assert "inc hosp" in html
     assert ">4<" in html
-    assert "..." in html
+    assert ELLIPSIS_DISPLAY in html
+    # Missing values render uniformly, whatever the submission used.
+    assert "NaN" not in html
+    assert "None" not in html
+
+
+def test_snippet_columns_use_one_canonical_order():
+    from pipeline.jsonld_to_html import SNIPPET_DISPLAY_COLUMNS, canonicalize_snippet
+
+    scrambled = pd.DataFrame(
+        [["US", 1, "a", 2.0, "s1", "inc hosp", "2025-07-27", "sample", None, 3, 4]],
+        columns=[
+            "location", "run_grouping", "age_group", "value", "scenario_id",
+            "target", "origin_date", "output_type", "output_type_id",
+            "horizon", "stochastic_run",
+        ],
+    )
+    ordered = list(canonicalize_snippet(scrambled).columns)
+    assert ordered[:6] == [
+        "origin_date", "scenario_id", "target", "horizon", "location", "age_group",
+    ]
+    assert all(column in ordered for column in SNIPPET_DISPLAY_COLUMNS)
+
+
+def test_missing_values_render_as_a_single_marker():
+    from pipeline.jsonld_to_html import normalize_missing
+
+    for raw in [None, float("nan"), "NA", "NaN", "None", "null", ""]:
+        assert normalize_missing(raw) == MISSING_DISPLAY
+    assert normalize_missing("inc hosp") == "inc hosp"
+    assert normalize_missing(0) == 0
 
 
 def test_get_first_n_rows_reads_gz_parquet(monkeypatch, tmp_path):
@@ -168,7 +203,7 @@ def test_output_types_section_renders_parquet_metadata():
     assert "Number of samples:</strong> 25" in html
     assert "Compound task ID set" in html
     assert "location" in html
-    assert "https://docs.hubverse.io/en/latest/user-guide/sample-output-type.html" in html
+    assert "https://github.com/midas-network/rsv-scenario-modeling-hub/blob/main/model-output/README.md#sample" in html
 
 
 def test_ensemble_output_types_section_labels_quantiles_as_calculated():
@@ -244,3 +279,46 @@ def test_quantile_metadata_escapes_html_special_characters():
     assert "0.5<b>" not in html
     assert "0.5&lt;b&gt;" in html
     assert "0.9&amp;" in html
+
+
+def test_abstract_section_renders_markdown_in_details():
+    html = generate_abstract_section({"abstract": "## Aims\n\nProject **RSV** spread.\n\n- one"})
+
+    assert "<details" in html
+    assert "<h4>Aims</h4>" in html
+    assert "<li>one</li>" in html
+
+
+def test_abstract_section_absent_returns_empty():
+    assert generate_abstract_section({}) == ""
+    assert generate_abstract_section({"abstract": "   "}) == ""
+
+
+def test_abstract_section_escapes_markup():
+    html = generate_abstract_section(
+        {"abstract": "## <script>alert(1)</script>\n\n<img src=x onerror=y> [x](javascript:alert(1))"}
+    )
+
+    assert "<script>" not in html
+    assert "<img" not in html
+    assert "&lt;script&gt;" in html
+    assert 'href="javascript' not in html
+
+
+def test_header_and_cover_list_reports_from_list_subject_of():
+    data = {
+        "name": "Round",
+        "subjectOf": [
+            {"@type": "CreativeWork", "url": "https://example.org/round.md"},
+            {"@type": "Report", "name": "National <b>Report</b>", "url": "https://example.org/r.pdf"},
+        ],
+    }
+
+    header = generate_header_section(data)
+    cover = generate_cover_section(data, [])
+
+    for html in (header, cover):
+        assert 'href="https://example.org/r.pdf"' in html
+        assert "<b>" not in html
+        assert "National &lt;b&gt;Report&lt;/b&gt;" in html
+    assert "https://example.org/round.md" in header

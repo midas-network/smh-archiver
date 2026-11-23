@@ -2,7 +2,9 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
+from datetime import datetime
 from html import escape
 from pathlib import Path
 
@@ -11,7 +13,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 import pandas as pd
 
-from utils.output_types import get_output_type_definition
+from utils.jsonld import as_list
+from utils.markdown import basic_markdown_to_html
+from utils.output_types import (
+    definition_source_label,
+    get_output_type_definition,
+    human_iri_link,
+)
 from utils.output_type_summary import (
     load_model_output_from_dir,
     summarize_output_type_metadata,
@@ -19,7 +27,8 @@ from utils.output_type_summary import (
     summarize_sample_output,
 )
 
-HUBVERSE_SAMPLE_OUTPUT_DOC_URL = "https://docs.hubverse.io/en/latest/user-guide/sample-output-type.html"
+SMH_OUTPUT_DOC_URL = "https://github.com/midas-network/rsv-scenario-modeling-hub/blob/main/model-output/README.md"
+SMH_SAMPLE_OUTPUT_DOC_URL = SMH_OUTPUT_DOC_URL + "#sample"
 
 
 def load_model_output_dataframe(round_id, model):
@@ -27,15 +36,86 @@ def load_model_output_dataframe(round_id, model):
     return load_model_output_from_dir(model_dir, model)
 
 
+# Submissions store these columns in at least three different orders. The
+# catalog is a comparison document, so it always presents them the same way.
+CANONICAL_SNIPPET_COLUMNS = [
+    "origin_date",
+    "scenario_id",
+    "target",
+    "horizon",
+    "location",
+    "age_group",
+    "output_type",
+    "output_type_id",
+    "value",
+    "run_grouping",
+    "stochastic_run",
+]
+
+# The illustrative table shows a readable subset. output_type_id is kept even
+# though it is not strictly identifying: without it every quantile row looks
+# like a duplicate of its neighbours with an unexplained different value.
+SNIPPET_DISPLAY_COLUMNS = [
+    "scenario_id",
+    "target",
+    "horizon",
+    "location",
+    "age_group",
+    "output_type",
+    "output_type_id",
+    "value",
+]
+
+MISSING_DISPLAY = "\u2014"
+ELLIPSIS_DISPLAY = "\u2026"
+MISSING_TOKENS = {"na", "nan", "none", "null", "<na>", ""}
+
+
+def canonicalize_snippet(df):
+    """Impose one display order and one missing-value representation."""
+    ordered = [c for c in CANONICAL_SNIPPET_COLUMNS if c in df.columns]
+    remaining = [c for c in df.columns if c not in ordered]
+    return df[ordered + remaining]
+
+
+def normalize_missing(value):
+    """Render NA / NaN / None uniformly; the raw values stay in the data files."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return MISSING_DISPLAY
+    try:
+        if pd.isna(value):
+            return MISSING_DISPLAY
+    except (TypeError, ValueError):
+        pass
+    return MISSING_DISPLAY if str(value).strip().lower() in MISSING_TOKENS else value
+
+
 def format_first_n_rows_of_output(n, df):
     if df.empty:
         return ""
 
+    df = canonicalize_snippet(df)
+    display_columns = [c for c in SNIPPET_DISPLAY_COLUMNS if c in df.columns]
+    hidden = [c for c in df.columns if c not in display_columns]
+    if display_columns:
+        df = df[display_columns]
+
     # Get the first `n` rows and the last row
     if len(df) > n:
-        df = pd.concat([df.head(n), pd.DataFrame([["..."] * len(df.columns)], columns=df.columns), df.tail(1)])
+        df = pd.concat([
+            df.head(n),
+            pd.DataFrame([[ELLIPSIS_DISPLAY] * len(df.columns)], columns=df.columns),
+            df.tail(1),
+        ])
 
-    html_output = df.to_html(index=False, border=0)
+    df = df.astype(object).map(normalize_missing)
+    html_output = df.to_html(index=False, border=0, na_rep=MISSING_DISPLAY)
+    if hidden:
+        html_output += (
+            '<p class="snippet-note">Example records. '
+            f'Columns not shown: {", ".join(hidden)}. '
+            f'<a href="{SMH_OUTPUT_DOC_URL}" target="_blank">View SMH output specification</a></p>\n'
+        )
     return html_output
 
 
@@ -58,6 +138,27 @@ def load_geodata_mapping():
                 mapping[iso_code] = geoname_url
 
     return mapping
+
+
+LICENSE_DISPLAY_NAMES = {
+    "cc-by-4.0": "CC BY 4.0",
+    "cc-by-sa-4.0": "CC BY-SA 4.0",
+    "cc-by_sa-4.0": "CC BY-SA 4.0",
+    "cc-by-nc-4.0": "CC BY-NC 4.0",
+    "mit": "MIT",
+    "bsd simplified": "BSD Simplified",
+    "bsd-2-clause": "BSD 2-Clause",
+    "gpl-3.0": "GPL 3.0",
+    "apache-2.0": "Apache 2.0",
+    "zenodo-freetoread-1.0": "Zenodo Free-to-Read",
+}
+
+
+def format_license_name(value):
+    """Human-facing license label; submissions vary only by case and spacing."""
+    if not value:
+        return "N/A"
+    return LICENSE_DISPLAY_NAMES.get(str(value).strip().lower(), str(value))
 
 
 def get_license_map():
@@ -238,6 +339,60 @@ def generate_html_head(title):
         .tab-content.active {{
             display: block;
         }}
+        .tab-title {{ display: none; }}
+        .print-only, .print-only-inline {{ display: none; }}
+        .chip {{
+            display: inline-block;
+            padding: 1px 6px;
+            margin: 1px 3px 1px 0;
+            border: 1px solid #cfd8e3;
+            border-radius: 3px;
+            background: #f7fafc;
+            font-size: 0.92em;
+            white-space: nowrap;
+        }}
+        .facts {{
+            border-collapse: collapse;
+            margin: 6px 0 10px;
+        }}
+        .facts td {{ padding: 2px 18px 2px 0; vertical-align: top; }}
+        .facts .facts-label {{
+            color: #7f8c8d;
+            text-transform: uppercase;
+            font-size: 0.78em;
+            letter-spacing: 0.04em;
+        }}
+        table.matrix {{
+            border-collapse: collapse;
+            width: 100%;
+            font-size: 0.9em;
+        }}
+        table.matrix th {{
+            background: #3498db;
+            color: #fff;
+            text-align: left;
+            padding: 4px 6px;
+        }}
+        table.matrix td {{
+            border-bottom: 1px solid #e3e9f0;
+            padding: 3px 6px;
+            vertical-align: top;
+        }}
+        .cover-metrics {{ margin: 18px 0 6px; }}
+        .cover-metric {{ display: inline-block; margin-right: 42px; }}
+        .cover-metric .num {{
+            display: block;
+            font-size: 2.1em;
+            font-weight: 700;
+            color: #2c3e50;
+            line-height: 1.1;
+        }}
+        .cover-metric .cap {{
+            color: #7f8c8d;
+            text-transform: uppercase;
+            font-size: 0.78em;
+            letter-spacing: 0.05em;
+        }}
         table {{
             padding: 0px 10px;
         }}
@@ -282,15 +437,41 @@ def generate_html_head(title):
 """
 
 
+def split_subject_of(data):
+    """Split ``subjectOf`` (dict or list) into (round definition dict, report dicts)."""
+    items = [i for i in as_list(data.get('subjectOf')) if isinstance(i, dict)]
+    reports = [i for i in items if i.get('@type') == 'Report' and i.get('url')]
+    documentation = next((i for i in items if i.get('@type') != 'Report'), {})
+    return documentation, reports
+
+
+def generate_abstract_section(model):
+    """Render a model's markdown abstract, escaped, inside a collapsible block."""
+    abstract = model.get('abstract')
+    if not abstract or not str(abstract).strip():
+        return ''
+    # Demote the abstract's own headings so they sit below the section heading.
+    demoted = re.sub(r'^(#+)', r'\1##', str(abstract), flags=re.MULTILINE)
+    body = basic_markdown_to_html(demoted)
+    return (
+        '        <details class="model-abstract">\n'
+        '            <summary><strong>Model abstract</strong></summary>\n'
+        f'{body}\n'
+        '        </details>\n'
+    )
+
+
 def generate_header_section(data):
     """Generate the header section with dataset information."""
+    models = data.get('hasPart') or []
+    ensembles = sum('ensemble' in model.get('name', '').casefold() for model in models)
     html = f"""    <h1>{data.get('name', 'Dataset')}</h1>
     <p class="metadata"><strong>Description:</strong> {data.get('description', 'N/A')}</p>
     <p class="metadata"><strong>Identifier:</strong> {data.get('identifier', 'N/A')}</p>
-    <p class="metadata"><strong>Number of Models:</strong> {data.get('numberOfItems', 0)}</p>
+    <p class="metadata"><strong>Team-model outputs:</strong> {len(models) - ensembles}; <strong>Ensemble projection datasets:</strong> {ensembles}</p>
 """
 
-    documentation = data.get("subjectOf") if isinstance(data.get("subjectOf"), dict) else {}
+    documentation, reports = split_subject_of(data)
     documentation_url = documentation.get("url") or data.get("url")
     raw_url = documentation.get("sameAs") or data.get("sameAs")
 
@@ -303,13 +484,20 @@ def generate_header_section(data):
             html += f' (<a href="{raw_url}" target="_blank">raw markdown</a>)'
         html += '</p>\n'
 
+    if reports:
+        links = '; '.join(
+            f'<a href="{escape(str(r["url"]), quote=True)}" target="_blank">{escape(str(r.get("name") or r["url"]))}</a>'
+            for r in reports
+        )
+        html += f'    <p class="metadata"><strong>Reports:</strong> {links}</p>\n'
+
     return html
 
 
 def generate_model_index(models):
     """Generate the clickable model index."""
     html = """    <div class="index" id="index">
-        <h2>Model Index</h2>
+        <h2>Team-model and Ensemble Index</h2>
         <ul>
 """
     for idx, model in enumerate(models):
@@ -438,16 +626,18 @@ def generate_spatial_coverage_section(model, geodata_map):
         location_name = location.get('gn:name', 'Unknown')
         location_code = location.get('iso3166-2:code', '')
 
-        html += '                <div class="author">\n'
+        short_code = location_code.split('-')[-1] if location_code else ''
+        label = f'{location_name} \u00b7 {short_code}' if short_code else location_name
         if location_code and location_code in geodata_map:
-            geoname_url = geodata_map[location_code]
-            html += f'                    <a href="{geoname_url}" target="_blank">{location_name} ({location_code})</a><br>\n'
+            target = geodata_map[location_code]
         elif location_code:
-            search_link = f"https://www.geonames.org/search.html?q={location_name.replace(' ', '+')}"
-            html += f'                    <a href="{search_link}" target="_blank">{location_name} ({location_code})</a><br>\n'
+            target = f"https://www.geonames.org/search.html?q={location_name.replace(' ', '+')}"
         else:
-            html += f'                    {location_name}<br>\n'
-        html += '                </div>\n'
+            target = None
+        if target:
+            html += f'                <span class="chip"><a href="{target}" target="_blank">{label}</a></span>\n'
+        else:
+            html += f'                <span class="chip">{label}</span>\n'
 
     return html
 
@@ -494,8 +684,8 @@ def generate_output_type_metadata_html(output_type, output_type_metadata, is_ens
             )
 
         html += (
-            f'                    <a href="{HUBVERSE_SAMPLE_OUTPUT_DOC_URL}" target="_blank">'
-            "Hubverse sample output documentation</a><br>\n"
+            f'                    <a href="{SMH_SAMPLE_OUTPUT_DOC_URL}" target="_blank">'
+            "SMH sample output documentation</a><br>\n"
         )
 
     if normalized_output_type == "quantile" and metadata.get("quantiles"):
@@ -532,13 +722,21 @@ def generate_output_types_section(model, output_type_metadata=None):
         definition = get_output_type_definition(output_type)
         html += '                <div class="author">\n'
         if definition:
-            html += f'                    <strong>{output_type}</strong> — {definition["label"]}<br>\n'
-            html += f'                    {definition["definition"]}<br>\n'
+            html += f'                    <strong>{output_type}</strong> — {definition["label"]}'
+            # Print carries the shared definition once, in the Data Dictionary.
+            html += (
+                f'<a class="print-only-inline" href="#glossary-ot-'
+                f'{glossary_slug(normalize_output_type_name(output_type))}">'
+                ' — see Data Dictionary</a><br>\n'
+            )
+            html += '                    <span class="screen-only">\n'
+            html += f'                        {definition["definition"]}<br>\n'
             if definition.get("iri"):
                 html += (
-                    f'                    <a href="{definition["iri"]}" target="_blank">'
-                    f'Ontology reference ({definition["definition_source"]})</a><br>\n'
+                    f'                        <a href="{human_iri_link(definition["iri"])}" target="_blank">'
+                    f'Ontology reference ({definition_source_label(definition["definition_source"])})</a><br>\n'
                 )
+            html += '                    </span>\n'
         else:
             # Unknown output type: fall back to the bare string, never crash.
             html += f'                    {output_type}<br>\n'
@@ -555,11 +753,23 @@ def generate_age_groups_section(model):
 
     html = ''
     for age_group in model['workExample']['ageGroups']:
-        html += '                <div class="author">\n'
-        html += f'                    {age_group}<br>\n'
-        html += '                </div>\n'
+        html += f'                <span class="chip">{age_group}</span>\n'
 
     return html
+
+
+def open_tab_content(model_idx, slug, title, is_active):
+    """Open a tab panel with a real heading so the PDF outline picks it up."""
+    active_class = ' active' if is_active else ''
+    return (
+        f'            <div class="tab-content{active_class}" '
+        f'id="model-{model_idx}-content-{slug}">\n'
+        f'                <h3 class="tab-title">{title}</h3>\n'
+        '                <div class="tab-body">\n'
+    )
+
+
+CLOSE_TAB_CONTENT = '                </div>\n            </div>\n'
 
 
 def generate_tabbed_section(model, model_idx, geodata_map, sample_output_html, output_type_metadata=None):
@@ -608,49 +818,58 @@ def generate_tabbed_section(model, model_idx, geodata_map, sample_output_html, o
 
     # Add tab content for projection data snippet
     if has_sample_output:
-        html += f'            <div class="tab-content active" id="model-{model_idx}-content-sample">\n'
+        html += open_tab_content(model_idx, 'sample', 'Projection Data Snippet', True)
         html += f'                {sample_output_html}\n'
-        html += '            </div>\n'
+        html += CLOSE_TAB_CONTENT
 
     # Add tab content for output types
     if has_output_types:
-        active_class = ' active' if first_tab == 'output' else ''
-        html += f'            <div class="tab-content{active_class}" id="model-{model_idx}-content-output">\n'
+        html += open_tab_content(
+            model_idx, 'output', 'Output Types', first_tab == 'output'
+        )
         html += generate_output_types_section(model, output_type_metadata)
-        html += '            </div>\n'
+        html += CLOSE_TAB_CONTENT
 
     # Add tab content for targets
     if has_targets:
-        active_class = ' active' if first_tab == 'targets' else ''
-        html += f'            <div class="tab-content{active_class}" id="model-{model_idx}-content-targets">\n'
+        html += open_tab_content(model_idx, 'targets', 'Targets', first_tab == 'targets')
         html += '                <div class="variables-grid">\n'
         for variable in model['workExample']['variableMeasured']:
+            anchor = glossary_slug(variable.get('target_id') or variable.get('name') or '')
             html += '                    <div class="author">\n'
-            html += f'                        <strong>{variable.get("name", "Unknown Variable")}</strong><br>\n'
-            html += f'                        <strong>Unit:</strong> {variable.get("unitText", "N/A")}<br>\n'
-            html += f'                        <strong>Target ID:</strong> {variable.get("target_id", "N/A")}<br>\n'
-            html += f'                        <strong>Type:</strong> {variable.get("target_type", "N/A")}<br>\n'
+            html += f'                        <strong>{variable.get("name", "Unknown Variable")}</strong>'
+            html += (
+                f'<a class="print-only-inline" href="#glossary-target-{anchor}">'
+                ' — see Data Dictionary</a><br>\n'
+            )
+            html += '                        <span class="screen-only">\n'
+            html += f'                            <strong>Unit:</strong> {variable.get("unitText", "N/A")}<br>\n'
+            html += f'                            <strong>Target ID:</strong> {variable.get("target_id", "N/A")}<br>\n'
+            html += f'                            <strong>Type:</strong> {variable.get("target_type", "N/A")}<br>\n'
+            html += '                        </span>\n'
             html += f'                        <strong>Possible Output Types:</strong> <span class="no-wrap">{format_available_output_types(variable)}</span> <br>\n'
-            html += f'                        <strong>Temporal Unit:</strong> {variable.get("temporalUnit", "N/A")}<br>\n'
+            html += '                        <span class="screen-only">\n'
+            html += f'                            <strong>Temporal Unit:</strong> {variable.get("temporalUnit", "N/A")}<br>\n'
             if 'identifier' in variable:
-                html += f'                        <a href="{variable["identifier"]}" target="_blank">Ontology Reference</a><br>\n'
+                html += f'                            <a href="{variable["identifier"]}" target="_blank">Ontology Reference</a><br>\n'
+            html += '                        </span>\n'
             html += '                    </div>\n'
         html += '                </div>\n'
-        html += '            </div>\n'
+        html += CLOSE_TAB_CONTENT
 
     # Add tab content for spatial coverage
     if has_spatial:
-        active_class = ' active' if first_tab == 'spatial' else ''
-        html += f'            <div class="tab-content{active_class}" id="model-{model_idx}-content-spatial">\n'
+        html += open_tab_content(
+            model_idx, 'spatial', 'Spatial Coverage', first_tab == 'spatial'
+        )
         html += generate_spatial_coverage_section(model, geodata_map)
-        html += '            </div>\n'
+        html += CLOSE_TAB_CONTENT
 
     # Add tab content for age groups
     if has_age_groups:
-        active_class = ' active' if first_tab == 'age' else ''
-        html += f'            <div class="tab-content{active_class}" id="model-{model_idx}-content-age">\n'
+        html += open_tab_content(model_idx, 'age', 'Age Groups', first_tab == 'age')
         html += generate_age_groups_section(model)
-        html += '            </div>\n'
+        html += CLOSE_TAB_CONTENT
 
     html += '        </div>\n'
     return html
@@ -673,6 +892,197 @@ def generate_temporal_coverage_section(model):
         return f'        <p><strong>Temporal Coverage:</strong> <span class="location">{temporal}</span></p>\n'
 
 
+def iter_output_types(model):
+    """Flatten a model's output_type field, which stores nested lists."""
+    types = []
+    for item in (model.get('workExample') or {}).get('output_type') or []:
+        types.extend(item) if isinstance(item, list) else types.append(item)
+    return types
+
+
+def collection_metrics(models):
+    """Summarize a round using only fields actually present in the JSON-LD.
+
+    Deliberately omits scenario counts: the source metadata carries no scenario
+    field, and a cover figure that cannot be derived should not be invented.
+    """
+    geographies, age_groups, targets, output_types, spans = set(), set(), set(), set(), set()
+    for model in models:
+        work = model.get('workExample') or {}
+        for place in work.get('spatialCoverage') or []:
+            geographies.add(place.get('iso3166-2:code') or place.get('gn:name'))
+        age_groups.update(work.get('ageGroups') or [])
+        for variable in work.get('variableMeasured') or []:
+            targets.add(variable.get('target_id'))
+        output_types.update(iter_output_types(model))
+        if work.get('temporalCoverage'):
+            spans.add(work['temporalCoverage'])
+
+    weeks = None
+    if len(spans) == 1 and '/' in next(iter(spans)):
+        start_text, end_text = (part.strip() for part in next(iter(spans)).split('/'))
+        try:
+            start = datetime.fromisoformat(start_text)
+            end = datetime.fromisoformat(end_text)
+            weeks = round((end - start).days / 7)
+        except ValueError:
+            weeks = None
+
+    return {
+        'models': len(models),
+        'team_models': sum('ensemble' not in model.get('name', '').casefold() for model in models),
+        'ensembles': sum('ensemble' in model.get('name', '').casefold() for model in models),
+        'geographies': len({g for g in geographies if g}),
+        'age_groups': len(age_groups),
+        'targets': len({t for t in targets if t}),
+        'output_types': sorted(output_types),
+        'weeks': weeks,
+    }
+
+
+def generate_cover_section(data, models):
+    """Print-only collection overview that opens the PDF."""
+    metrics = collection_metrics(models)
+    tiles = [(metrics['team_models'], 'Team-model outputs'), (metrics['ensembles'], 'Ensembles'), (metrics['geographies'], 'Geographies')]
+    if metrics['weeks']:
+        tiles.append((metrics['weeks'], 'Week horizon'))
+    tiles.append((metrics['targets'], 'Targets'))
+    tiles.append((metrics['age_groups'], 'Age groups'))
+
+    html = '    <div class="print-only cover">\n'
+    html += f'        <h1 class="cover-title">{escape(str(data.get("name", "Dataset")))}</h1>\n'
+    if data.get('description'):
+        html += f'        <p class="cover-lede">{escape(str(data["description"]))}</p>\n'
+    html += '        <div class="cover-metrics">\n'
+    for value, caption in tiles:
+        html += (
+            '            <div class="cover-metric">'
+            f'<span class="num">{value}</span>'
+            f'<span class="cap">{caption}</span></div>\n'
+        )
+    html += '        </div>\n'
+    if metrics['output_types']:
+        chips = ' '.join(f'<span class="chip">{escape(str(t))}</span>' for t in metrics['output_types'])
+        html += f'        <p><strong>Output types in this round:</strong> {chips}</p>\n'
+
+    documentation, reports = split_subject_of(data)
+    round_url = documentation.get('url') or data.get('url')
+    if round_url:
+        html += f'        <p><strong>Scenario/Round Definition:</strong> <a href="{escape(str(round_url))}">{escape(str(round_url))}</a></p>\n'
+    if reports:
+        links = '; '.join(
+            f'<a href="{escape(str(r["url"]), quote=True)}">{escape(str(r.get("name") or r["url"]))}</a>'
+            for r in reports
+        )
+        html += f'        <p><strong>Reports:</strong> {links}</p>\n'
+    html += '    </div>\n'
+    return html
+
+
+def generate_comparison_matrix(models):
+    """Print-only cross-model matrix.
+
+    Every column is derived from a structured JSON-LD field. Model approach
+    (compartmental, agent-based, ...) is intentionally absent: it exists only in
+    free-text descriptions, and inferring it would risk mislabelling methods in a
+    DOI-minted record.
+    """
+    if not models:
+        return ''
+
+    html = '    <div class="print-only matrix-section">\n'
+    html += '        <h2>Team-model Outputs and Ensembles at a Glance</h2>\n'
+    html += '        <table class="matrix">\n'
+    html += ('            <thead><tr>'
+             '<th>Team-model or ensemble</th><th>Team</th><th>Version</th><th>License</th>'
+             '<th>Age groups</th><th>Output types</th><th>Targets</th>'
+             '<th class="matrix-page-head">Page</th>'
+             '</tr></thead>\n')
+    html += '            <tbody>\n'
+    for idx, model in enumerate(models):
+        work = model.get('workExample') or {}
+        producer = model.get('producer') or {}
+        team = producer.get('name', '') if isinstance(producer, dict) else str(producer)
+        out_types = sorted(set(iter_output_types(model)))
+        chips = ' '.join(f'<span class="chip">{escape(str(t))}</span>' for t in out_types) or '&mdash;'
+        html += (
+            '                <tr>'
+            f'<td><a href="#model-{idx}">{escape(str(model.get("name", "Unknown")))}</a></td>'
+            f'<td>{escape(str(team))}</td>'
+            f'<td>{escape(str(model.get("version", "")))}</td>'
+            f'<td>{escape(format_license_name(model.get("license")))}</td>'
+            f'<td>{len(work.get("ageGroups") or [])}</td>'
+            f'<td>{chips}</td>'
+            f'<td>{len(work.get("variableMeasured") or [])}</td>'
+            f'<td class="matrix-page"><a href="#model-{idx}"></a></td>'
+            '</tr>\n'
+        )
+    html += '            </tbody>\n        </table>\n    </div>\n'
+    return html
+
+
+def glossary_slug(text):
+    """Stable anchor fragment for a glossary entry."""
+    return re.sub(r'[^a-z0-9]+', '-', str(text).strip().lower()).strip('-')
+
+
+def collect_glossary(models):
+    """Gather the definitions that are otherwise repeated for every model."""
+    output_types, targets = {}, {}
+    for model in models:
+        for output_type in iter_output_types(model):
+            key = normalize_output_type_name(output_type)
+            if key not in output_types:
+                output_types[key] = (output_type, get_output_type_definition(output_type))
+        for variable in (model.get('workExample') or {}).get('variableMeasured') or []:
+            key = variable.get('target_id') or variable.get('name')
+            if key and key not in targets:
+                targets[key] = variable
+    return output_types, targets
+
+
+def generate_glossary_section(models):
+    """Print-only glossary carrying the shared output-type and target definitions."""
+    output_types, targets = collect_glossary(models)
+    if not output_types and not targets:
+        return ''
+
+    html = '    <div class="print-only glossary" id="glossary">\n'
+    html += '        <h2>Data Dictionary</h2>\n'
+    html += ('        <p class="metadata">Definitions below apply to every model in this '
+             'round. Each model profile lists which of these it uses.</p>\n')
+
+    if output_types:
+        html += '        <h3>Output types</h3>\n'
+        for key, (label, definition) in sorted(output_types.items()):
+            html += f'        <div class="glossary-entry" id="glossary-ot-{glossary_slug(key)}">\n'
+            if definition:
+                html += f'            <strong>{escape(str(label))}</strong> &mdash; {escape(str(definition["label"]))}<br>\n'
+                html += f'            {escape(str(definition["definition"]))}<br>\n'
+                if definition.get('iri'):
+                    html += (f'            <a href="{escape(human_iri_link(definition["iri"]))}">Ontology reference '
+                             f'({escape(definition_source_label(definition["definition_source"]))})</a>\n')
+            else:
+                html += f'            <strong>{escape(str(label))}</strong>\n'
+            html += '        </div>\n'
+
+    if targets:
+        html += '        <h3>Targets</h3>\n'
+        for key, variable in sorted(targets.items()):
+            html += f'        <div class="glossary-entry" id="glossary-target-{glossary_slug(key)}">\n'
+            html += f'            <strong>{escape(str(variable.get("name", key)))}</strong>\n'
+            html += f'            <strong>Target ID:</strong> {escape(str(variable.get("target_id", "N/A")))}\n'
+            html += f'            <strong>Unit:</strong> {escape(str(variable.get("unitText", "N/A")))}\n'
+            html += f'            <strong>Type:</strong> {escape(str(variable.get("target_type", "N/A")))}\n'
+            html += f'            <strong>Temporal Unit:</strong> {escape(str(variable.get("temporalUnit", "N/A")))}\n'
+            if variable.get('identifier'):
+                html += f'            <a href="{escape(str(variable["identifier"]))}">Ontology Reference</a>\n'
+            html += '        </div>\n'
+
+    html += '    </div>\n'
+    return html
+
+
 def parse_jsonld_to_html(jsonld_file, round_id):
     """Parse JSON-LD file and generate an HTML webpage."""
 
@@ -686,11 +1096,17 @@ def parse_jsonld_to_html(jsonld_file, round_id):
 
     # Build HTML
     html = generate_html_head(data.get('name', 'Dataset'))
-    html += generate_header_section(data)
 
-    # Generate model index (sorted alphabetically by model name)
     models = sorted(data.get('hasPart', []), key=lambda m: m.get('name', '').lower())
+
+    # Print opens with a collection cover and a cross-model matrix; the screen
+    # page keeps its existing header and clickable index.
+    html += generate_cover_section(data, models)
+    html += generate_comparison_matrix(models)
+    html += '    <div class="screen-header">\n'
+    html += generate_header_section(data)
     html += generate_model_index(models)
+    html += '    </div>\n'
 
     # Process each model
     for idx, model in enumerate(models):
@@ -708,6 +1124,7 @@ def parse_jsonld_to_html(jsonld_file, round_id):
 
         # Model header
         html += f"""    <div class="model" id="{model_id}">
+        <div class="model-intro">
         <div class="model-header">
             <h2>{model_name}</h2>
             <a href="#index" class="back-to-top">↑ Back to Index</a>
@@ -724,15 +1141,33 @@ def parse_jsonld_to_html(jsonld_file, round_id):
         # License with link
         if license in license_map:
             url = license_map[license]
-            info_parts.append(f'<strong>License:</strong> <a href="{url}" target="_blank">{license}</a>')
+            info_parts.append(f'<strong>License:</strong> <a href="{url}" target="_blank">{format_license_name(license)}</a>')
         else:
-            info_parts.append(f'<strong>License:</strong> {license}')
+            info_parts.append(f'<strong>License:</strong> {format_license_name(license)}')
 
         # Website
         if 'website' in model:
             info_parts.append(f'<strong>Website:</strong> <a href="{model["website"]}" target="_blank">{model["website"]}</a>')
 
-        html += f'        <p>{" ".join(info_parts)}</p>\n'
+        producer = model.get('producer') or {}
+        team = producer.get('name') if isinstance(producer, dict) else producer
+        facts = [('Version', version)]
+        if license in license_map:
+            facts.append(('License', f'<a href="{license_map[license]}" target="_blank">{format_license_name(license)}</a>'))
+        else:
+            facts.append(('License', format_license_name(license)))
+        if team:
+            facts.append(('Team', escape(str(team))))
+        if 'website' in model:
+            facts.append(('Website', f'<a href="{model["website"]}" target="_blank">Model website \u2197</a>'))
+        html += '        <table class="facts print-only"><tr>\n'
+        html += ''.join(f'            <td class="facts-label">{label}</td>\n' for label, _ in facts)
+        html += '        </tr><tr>\n'
+        html += ''.join(f'            <td>{value}</td>\n' for _, value in facts)
+        html += '        </tr></table>\n'
+        # The web page keeps the original inline form.
+        html += f'        <p class="screen-only">{" ".join(info_parts)}</p>\n'
+        html += '        </div>\n'
 
         # Target metadata
         html += generate_target_metadata_section(model)
@@ -756,6 +1191,8 @@ def parse_jsonld_to_html(jsonld_file, round_id):
         if 'description' in model:
             html += f'        <p><strong>Description:</strong> {model["description"]}</p>\n'
 
+        html += generate_abstract_section(model)
+
         # Data sources
         if 'isBasedOn' in model:
             html += f'        <p><strong>Data Sources:</strong> {model["isBasedOn"].get("description", "N/A")}</p>\n'
@@ -763,7 +1200,7 @@ def parse_jsonld_to_html(jsonld_file, round_id):
         # Producer
         if 'producer' in model:
             producer = model['producer']
-            html += f'        <p><strong>Team:</strong> {producer.get("name", "N/A")}</p>\n'
+            html += f'        <p class="screen-only"><strong>Team:</strong> {producer.get("name", "N/A")}</p>\n'
             if 'funder' in producer:
                 html += f'        <p><strong>Funding:</strong> {producer["funder"].get("description", "N/A")}</p>\n'
 
@@ -781,6 +1218,9 @@ def parse_jsonld_to_html(jsonld_file, round_id):
         # Add a separator between models for visual structure.
         if idx < len(models) - 1:
             html += '    <hr class="model-separator">\n'
+
+    # Shared definitions live once at the end instead of inside every model.
+    html += generate_glossary_section(models)
 
     # Close HTML
     html += """</body>

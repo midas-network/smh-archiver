@@ -206,7 +206,7 @@ def validate_html_file(filepath: Path) -> Tuple[bool, List[str]]:
         issues.append("HTML file seems too small, may be missing content")
 
     # Check for common elements
-    expected_elements = ['Model Index', 'Authors', 'Spatial Coverage', 'Temporal Coverage', 'Age Groups']
+    expected_elements = ['Team-model and Ensemble Index', 'Authors', 'Spatial Coverage', 'Temporal Coverage', 'Age Groups']
     for element in expected_elements:
         if element not in content:
             issues.append(f"Missing expected content: {element}")

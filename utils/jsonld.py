@@ -13,7 +13,9 @@ from utils.temporal import calculate_temporal_coverage
 
 ROUND_DEFINITION_BRANCH = "main"
 ROUND_DEFINITION_FOLDER = "auxiliary-data/rounds"
-DEFAULT_UNKNOWN_LICENSE = "zenodo-freetoread-1.0"
+# Rounds 1 and 2 declare a single report with no short_description. The hub asked for the
+# plain word rather than the filename stem, which would read "Round1" for two distinct rounds.
+DEFAULT_REPORT_NAME = "Report"
 UNKNOWN_LICENSE_VALUES = {
     "",
     "na",
@@ -27,12 +29,12 @@ UNKNOWN_LICENSE_VALUES = {
 
 
 def normalize_license(license_value):
-    """Return a declared license or the conservative Zenodo fallback."""
+    """Preserve declared terms; an absent license does not grant permissions."""
     if license_value is None:
-        return DEFAULT_UNKNOWN_LICENSE
+        return None
     normalized = str(license_value).strip()
     if normalized.casefold() in UNKNOWN_LICENSE_VALUES:
-        return DEFAULT_UNKNOWN_LICENSE
+        return None
     return normalized
 
 
@@ -85,32 +87,88 @@ def build_round_documentation(github_repo, internal_round_name):
     }
 
 
-def apply_round_documentation(jsonld_data, round_documentation):
-    """Attach round/scenario documentation links to a JSON-LD object."""
-    if not round_documentation:
-        return
+def as_list(value):
+    """Normalize a JSON-LD value that may be absent, a single object, or a list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
 
-    url = round_documentation.get("url")
-    raw_url = round_documentation.get("rawUrl")
-    if not url and not raw_url:
-        return
+
+def new_report_subject_of(github_repo, source_ref, report_records):
+    """Build ``Report`` entries for a round's PDFs, with URLs at the pinned source ref."""
+    if not github_repo or not source_ref:
+        return []
+    repo = str(github_repo).strip().removeprefix("https://github.com/")
+    repo = repo.removesuffix(".git").strip("/")
+    reports = []
+    for record in report_records or []:
+        filename = record.get("filename")
+        if not filename:
+            continue
+        path = str(record.get("path") or filename).lstrip("/")
+        name = record.get("short_description") or DEFAULT_REPORT_NAME
+        reports.append({
+            "@type": "Report",
+            "name": name,
+            "encodingFormat": "application/pdf",
+            "url": f"https://github.com/{repo}/blob/{source_ref}/{path}",
+        })
+    return reports
+
+
+def read_round_reports(round_path):
+    """Return ``(github_repo, ref, records)`` from a round's snapshot and reports sidecar."""
+    round_path = Path(round_path)
+    sidecar = round_path / "reports" / "reports.json"
+    snapshot = round_path / "source_snapshot.json"
+    if not sidecar.exists() or not snapshot.exists():
+        return None, None, []
+    records = json.loads(sidecar.read_text(encoding="utf-8"))
+    snap = json.loads(snapshot.read_text(encoding="utf-8"))
+    return snap.get("repository"), snap.get("ref"), records
+
+
+def read_model_abstract(round_path, round_id, model_name):
+    """Return the model abstract markdown verbatim, or None when there is none."""
+    path = Path(round_path) / "model-abstracts" / model_name / f"{round_id}-{model_name}.md"
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def apply_round_documentation(jsonld_data, round_documentation, reports=None):
+    """Attach round/scenario documentation links and reports to a JSON-LD object.
+
+    ``subjectOf`` is a list: the round definition first, then one entry per report.
+    """
+    subject_of = []
+    url = raw_url = None
+    if round_documentation:
+        url = round_documentation.get("url")
+        raw_url = round_documentation.get("rawUrl")
 
     if url:
         jsonld_data["url"] = url
     if raw_url:
         jsonld_data["sameAs"] = raw_url
 
-    documentation = {
-        "@type": "CreativeWork",
-        "name": "Scenario/round definition",
-        "encodingFormat": "text/markdown",
-    }
-    if url:
-        documentation["url"] = url
-    if raw_url:
-        documentation["sameAs"] = raw_url
+    if url or raw_url:
+        documentation = {
+            "@type": "CreativeWork",
+            "name": "Scenario/round definition",
+            "encodingFormat": "text/markdown",
+        }
+        if url:
+            documentation["url"] = url
+        if raw_url:
+            documentation["sameAs"] = raw_url
+        subject_of.append(documentation)
 
-    jsonld_data["subjectOf"] = documentation
+    subject_of.extend(reports or [])
+    if subject_of:
+        jsonld_data["subjectOf"] = subject_of
 
 
 def get_consolidated_round_id(jsonld_data):
@@ -284,7 +342,7 @@ def remove_none_values(obj):
     else:
         return obj
 
-def yaml_to_jsonld(yaml_file_path):
+def yaml_to_jsonld(yaml_file_path, abstract=None):
     """Convert a YAML file to JSON-LD using schema.org vocabulary"""
     with open(yaml_file_path, 'r') as file:
         data = yaml.safe_load(file)
@@ -302,6 +360,7 @@ def yaml_to_jsonld(yaml_file_path):
         "description": data.get("methods_long") or data.get("methods"),
         "version": data.get("model_version"),
         "license": normalize_license(data.get("license")),
+        "abstract": abstract,
     }
 
     missing_val = ["NA", "na", "TBD", "N/A", "NaN"]
@@ -349,7 +408,8 @@ def yaml_to_jsonld(yaml_file_path):
     return jsonld
 
 def create_consolidated_round_jsonld(round_output_dir, round_id, config, global_field_values_dict,
-                                     field_values_by_model, output_dir="output", schema_version=None):
+                                     field_values_by_model, output_dir="output", schema_version=None,
+                                     reports=None):
     """
     Create a consolidated JSON-LD file for the entire round that includes data from all model JSON-LD files.
 
@@ -393,7 +453,7 @@ def create_consolidated_round_jsonld(round_output_dir, round_id, config, global_
                 }
 
     consolidated["roundId"] = round_id
-    apply_round_documentation(consolidated, round_documentation)
+    apply_round_documentation(consolidated, round_documentation, reports)
 
 
 

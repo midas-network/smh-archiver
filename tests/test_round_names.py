@@ -74,19 +74,21 @@ def test_v5_add_round_info_uses_configured_round_name():
             "https://raw.githubusercontent.com/midas-network/rsv-scenario-modeling-hub/"
             "refs/heads/main/auxiliary-data/rounds/round3.md"
         ),
-        "subjectOf": {
-            "@type": "CreativeWork",
-            "name": "Scenario/round definition",
-            "encodingFormat": "text/markdown",
-            "url": (
-                "https://github.com/midas-network/rsv-scenario-modeling-hub/"
-                "blob/main/auxiliary-data/rounds/round3.md"
-            ),
-            "sameAs": (
-                "https://raw.githubusercontent.com/midas-network/rsv-scenario-modeling-hub/"
-                "refs/heads/main/auxiliary-data/rounds/round3.md"
-            ),
-        },
+        "subjectOf": [
+            {
+                "@type": "CreativeWork",
+                "name": "Scenario/round definition",
+                "encodingFormat": "text/markdown",
+                "url": (
+                    "https://github.com/midas-network/rsv-scenario-modeling-hub/"
+                    "blob/main/auxiliary-data/rounds/round3.md"
+                ),
+                "sameAs": (
+                    "https://raw.githubusercontent.com/midas-network/rsv-scenario-modeling-hub/"
+                    "refs/heads/main/auxiliary-data/rounds/round3.md"
+                ),
+            }
+        ],
     }
 
 

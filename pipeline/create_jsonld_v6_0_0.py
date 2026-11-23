@@ -18,6 +18,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from utils.jsonld import (
     apply_round_documentation,
+    new_report_subject_of,
+    read_model_abstract,
+    read_round_reports,
     build_round_documentation,
     format_round_filename_stem,
     format_round_name,
@@ -408,7 +411,9 @@ def process_single_model(
 
     logging.info(f"Processing {model_name}...")
 
-    jsonld_data = yaml_to_jsonld(str(yaml_path))
+    jsonld_data = yaml_to_jsonld(
+        str(yaml_path), abstract=read_model_abstract(round_path, round_id, model_name)
+    )
 
     if model_output_dir.exists():
         try:
@@ -446,7 +451,8 @@ def process_single_model(
 
 
 def create_consolidated_round_jsonld_v6(
-    round_output_dir, output_dir, round_id, round_name, round_documentation, diseases
+    round_output_dir, output_dir, round_id, round_name, round_documentation, diseases,
+    reports=None,
 ):
     """Create a consolidated round-level JSON-LD for all model JSON-LD files."""
     logging.info(f"Creating consolidated JSON-LD for round {round_id}...")
@@ -492,7 +498,7 @@ def create_consolidated_round_jsonld_v6(
     elif disease_entries:
         consolidated["healthCondition"] = disease_entries
 
-    apply_round_documentation(consolidated, round_documentation)
+    apply_round_documentation(consolidated, round_documentation, reports)
 
     for jsonld_file in jsonld_files:
         file_path = Path(round_output_dir) / jsonld_file
@@ -565,8 +571,12 @@ def process_round(round_dir, output_dir):
         )
         results.append(result)
 
+    repo, source_ref, report_records = read_round_reports(round_path)
+    reports = new_report_subject_of(repo, source_ref, report_records)
+
     create_consolidated_round_jsonld_v6(
-        round_output_dir, output_dir, round_id, round_name, round_documentation, diseases
+        round_output_dir, output_dir, round_id, round_name, round_documentation, diseases,
+        reports,
     )
 
     return results

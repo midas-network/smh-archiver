@@ -19,7 +19,88 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from utils.config import read_repos_yaml
 
 
-def clone_and_extract_dirs(repo_url, dirs_to_copy, output_dir, ref='main', ref_type='branch'):
+REPORT_CONFIG = os.path.join("hub-config", "report.json")
+REPORT_FALLBACK_PATH = "auxiliary-data/reports/"
+
+
+def select_report_entry(report_config, round_id):
+    """Return the ``report.json`` entry whose ``round_id`` matches, or None.
+
+    ``report.json`` is cumulative per tag, so entries for other rounds are ignored.
+    """
+    for entry in (report_config or {}).get("rounds", []):
+        if entry.get("round_id") == round_id:
+            return entry
+    return None
+
+
+def resolve_report_file(checkout_dir, declared_path, filename):
+    """Locate a declared report file, trying the declared path then the known fallback.
+
+    Returns ``(relative_path, absolute_path)`` or None if the file is nowhere.
+    """
+    for base in (declared_path, REPORT_FALLBACK_PATH):
+        if not base:
+            continue
+        rel = os.path.join(base, filename)
+        full = os.path.join(checkout_dir, rel)
+        if os.path.isfile(full):
+            return rel, full
+    return None
+
+
+def copy_round_reports(checkout_dir, report_config, round_id, output_dir, ref, run_checkout=None):
+    """Copy only the PDFs ``report.json`` lists for ``round_id`` into ``output_dir/reports``.
+
+    ``report_config`` must come from the ``report.json`` at the same ref as ``checkout_dir``:
+    ``path`` differs by tag (round 1's is stale at later tags). ``run_checkout`` is called after
+    the declared directory is added to the sparse checkout so it materializes. Missing pieces warn
+    rather than abort. Returns the sidecar records written.
+    """
+    entry = select_report_entry(report_config, round_id)
+    if entry is None:
+        print(f"⚠️ No report.json entry for round {round_id} at {ref}")
+        return []
+    declared_path = entry.get("path", "")
+    for sparse_path in dict.fromkeys([declared_path, REPORT_FALLBACK_PATH]):
+        if sparse_path:
+            subprocess.run(
+                ["git", "-C", checkout_dir, "sparse-checkout", "add", sparse_path],
+                check=True,
+            )
+    if run_checkout is not None:
+        run_checkout()
+    records = []
+    reports_dir = os.path.join(output_dir, "reports")
+    for item in entry.get("report", []):
+        filename = item.get("filename")
+        if not filename:
+            continue
+        found = resolve_report_file(checkout_dir, declared_path, filename)
+        if found is None:
+            print(f"⚠️ Report file not found at {ref}: {filename}")
+            continue
+        rel, full = found
+        if os.path.normpath(os.path.dirname(rel)) != os.path.normpath(declared_path):
+            print(f"⚠️ {filename} not at declared path {declared_path!r}; used {rel}")
+        os.makedirs(reports_dir, exist_ok=True)
+        shutil.copy2(full, os.path.join(reports_dir, filename))
+        records.append({
+            "filename": filename,
+            "short_description": item.get("short_description"),
+            "path": rel.replace(os.sep, "/"),
+            "ref": ref,
+        })
+    if records:
+        Path(reports_dir, "reports.json").write_text(
+            json.dumps(records, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"📄 Copied {len(records)} report(s) for round {round_id}")
+    return records
+
+
+def clone_and_extract_dirs(repo_url, dirs_to_copy, output_dir, ref='main', ref_type='branch',
+                           round_id=None):
     """
     Clone a GitHub repo to a temp folder, copy specific directories, and clean up.
 
@@ -85,18 +166,22 @@ def clone_and_extract_dirs(repo_url, dirs_to_copy, output_dir, ref='main', ref_t
             check=True,
         )
         checkout_ref = f"tags/{ref}" if ref_type == "tag" else ref
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                tmpdir,
-                "-c",
-                "advice.detachedHead=false",
-                "checkout",
-                checkout_ref,
-            ],
-            check=True,
-        )
+
+        def run_checkout():
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    tmpdir,
+                    "-c",
+                    "advice.detachedHead=false",
+                    "checkout",
+                    checkout_ref,
+                ],
+                check=True,
+            )
+
+        run_checkout()
 
         source_commit = subprocess.run(
             ["git", "-C", tmpdir, "rev-parse", "HEAD"],
@@ -104,6 +189,17 @@ def clone_and_extract_dirs(repo_url, dirs_to_copy, output_dir, ref='main', ref_t
             capture_output=True,
             text=True,
         ).stdout.strip()
+
+        if round_id:
+            report_path = os.path.join(tmpdir, REPORT_CONFIG)
+            if os.path.exists(report_path):
+                with open(report_path, encoding="utf-8") as fh:
+                    report_config = json.load(fh)
+                copy_round_reports(
+                    tmpdir, report_config, round_id, output_dir, ref, run_checkout
+                )
+            else:
+                print(f"⚠️ {REPORT_CONFIG} not found at {ref}; no reports for round {round_id}")
 
         for relative_path in dirs_to_copy:
             src = os.path.join(tmpdir, relative_path)
@@ -128,6 +224,16 @@ def write_source_snapshot(output_dir, repo_url, ref, ref_type, commit):
         "retrieved_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }
     snapshot_path = Path(output_dir) / "source_snapshot.json"
+    if snapshot_path.exists():
+        try:
+            previous = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        if previous.get("ref") == ref and previous.get("commit") not in (None, commit):
+            print(
+                f"⚠️ RETAGGED: {ref} previously resolved to {previous['commit']} "
+                f"but now resolves to {commit}"
+            )
     snapshot_path.write_text(
         json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -214,6 +320,8 @@ def delete_ignored_files_and_directories(directory, ignore_files_regex):
 
     # Second pass: Identify and delete matching directories (bottom-up)
     dirs_to_delete = []
+    # NOTE: ".*licen[sc]e.*" applies to everything under data/, including reports/ and
+    # model-abstracts/; a license-named file added upstream there would be deleted silently.
     for root, dirs, _ in os.walk(directory, topdown=False):
         for dir_name in dirs:
             for pattern in ignore_files_regex:
@@ -255,6 +363,24 @@ def keep_only_round_files(directory, round_id):
                 os.rmdir(dir_path)
             else:
                 team_model_round.append(dir)
+    # Clean model abstracts: same round, template dropped, only teams with model output
+    abstracts_dir = os.path.join(directory, "model-abstracts")
+    if os.path.isdir(abstracts_dir):
+        shutil.rmtree(os.path.join(abstracts_dir, "template"), ignore_errors=True)
+        for team in os.listdir(abstracts_dir):
+            team_path = os.path.join(abstracts_dir, team)
+            if not os.path.isdir(team_path):
+                continue
+            if team not in team_model_round:
+                print(f" Folder remove: {team_path}")
+                shutil.rmtree(team_path)
+                continue
+            for file in os.listdir(team_path):
+                if not file.startswith(f"{round_id}-"):
+                    print(f" File remove: {os.path.join(team_path, file)}")
+                    os.remove(os.path.join(team_path, file))
+            if not os.listdir(team_path):
+                os.rmdir(team_path)
     # Clean Metadata folder
     metadata_dir = os.path.join(directory, "model-metadata")
     for root, dirs, files in os.walk(metadata_dir):
@@ -350,7 +476,7 @@ if __name__ == "__main__":
 
                     print(f"\n🏷️ Processing tag: {tag}")
                     source_commit = clone_and_extract_dirs(
-                        repo_url, directories, tag_output_dir, tag, 'tag'
+                        repo_url, directories, tag_output_dir, tag, 'tag', round_id
                     )
                     write_source_snapshot(
                         tag_output_dir, repo_url, tag, 'tag', source_commit

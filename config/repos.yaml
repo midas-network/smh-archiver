@@ -6,7 +6,7 @@ repositories:
     directories:
       config: hub-config
       metadata: model-metadata
-      abstract: model-abstract
+      abstract: model-abstracts
       output: model-output
 
   # Example of additional repositories

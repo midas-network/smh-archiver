@@ -28,3 +28,22 @@ def get_output_type_definition(name):
     if name is None:
         return None
     return _load().get(str(name).strip().lower())
+
+
+def definition_source_label(definition_source):
+    """Short human-facing label for a ``definition_source`` (ProbOnto, STATO, ...)."""
+    source = str(definition_source or "ontology")
+    return "ProbOnto" if "probonto" in source.lower() else source
+
+
+def human_iri_link(iri):
+    """Human-facing link target; probonto.org IRIs go to the EBI OLS4 class page."""
+    from urllib.parse import quote
+
+    iri = str(iri)
+    if "probonto.org" in iri:
+        return (
+            "https://www.ebi.ac.uk/ols4/ontologies/probonto/classes/"
+            + quote(quote(iri, safe=""), safe="")
+        )
+    return iri
