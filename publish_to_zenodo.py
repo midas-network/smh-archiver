@@ -50,7 +50,7 @@ NATIVE_JSON_MEDIA_TYPE = "application/vnd.inveniordm.v1+json"
 DEFAULT_PREVIEW_FILE = "README.pdf"
 SOURCE_REPOSITORY = "https://github.com/midas-network/rsv-scenario-modeling-hub"
 HUB_WEBSITE = "https://rsvscenariomodelinghub.org/"
-PARSER_REPOSITORY = "https://github.com/midas-network/smh-to-jsonld"
+PARSER_REPOSITORY = "https://github.com/midas-network/smh-archiver"
 PARSER_RELEASE_TAG = "v0.1.0-beta.1"
 PARSER_RELEASE_URL = f"{PARSER_REPOSITORY}/releases/tag/{PARSER_RELEASE_TAG}"
 DEFAULT_RECORD_VERSION = "1.0.4"
@@ -1539,7 +1539,7 @@ def _build_release_readme(
         ),
         (
             f"Generated metadata was produced with {PARSER_RELEASE_TAG} of "
-            f"{_markdown_link('smh-to-jsonld', PARSER_RELEASE_URL)}. "
+            f"{_markdown_link('smh-archiver', PARSER_RELEASE_URL)}. "
             "See release_metadata.json for the exact parser commit used to build this upload."
         ),
         "## Funding by team-model",
@@ -2884,7 +2884,7 @@ def build_metadata(
         "method": (
             "Source snapshots are obtained from release-tagged rounds of the RSV "
             "Scenario Modeling Hub. Each data/{round}/source_snapshot.json records "
-            "the exact upstream tag and commit. The smh-to-jsonld pipeline preserves "
+            "the exact upstream tag and commit. The smh-archiver pipeline preserves "
             "the SMH hub configuration files, model metadata, and model output projections; "
             "derives per-model and consolidated Schema.org JSON-LD; renders HTML "
             "views for the archive; and renders README.pdf from README.md for the "

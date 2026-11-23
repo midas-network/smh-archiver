@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "description": "Hubverse output_type -> ontology term / definition mapping. Resolved in midas-network/smh-to-jsonld issue #25 (Lucie Contamin, Harry Hochheiser). Single source of truth consumed by utils/output_types.py.",
+    "description": "Hubverse output_type -> ontology term / definition mapping. Resolved in midas-network/smh-archiver issue #25 (Lucie Contamin, Harry Hochheiser). Single source of truth consumed by utils/output_types.py.",
     "learn_more_url": "https://docs.hubverse.io/en/latest/user-guide/model-output.html",
     "sources": {
       "STATO": "https://www.ebi.ac.uk/ols4/ontologies/stato",

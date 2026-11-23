@@ -1,7 +1,7 @@
 """Lookup for Hubverse output-type definitions and ontology IRIs.
 
 Single source of truth: utils/output_type_definitions.json (resolved in
-midas-network/smh-to-jsonld issue #25). Read relative to this file, not the
+midas-network/smh-archiver issue #25). Read relative to this file, not the
 process CWD, so the lookup works regardless of where the pipeline is invoked.
 """
 

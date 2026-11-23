@@ -2,15 +2,15 @@ This tool processes RSV Scenario Modeling Hub model outputs and generates
 consolidated JSON-LD metadata files for each scenario round.
 
 The current beta release is
-[`v0.1.0-beta.1`](https://github.com/midas-network/smh-to-jsonld/releases/tag/v0.1.0-beta.1).
+[`v0.1.0-beta.1`](https://github.com/midas-network/smh-archiver/releases/tag/v0.1.0-beta.1).
 
 ## Installation
 
 This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
 
 ```bash
-git clone https://github.com/midas-network/smh-to-jsonld.git
-cd smh-to-jsonld
+git clone https://github.com/midas-network/smh-archiver.git
+cd smh-archiver
 uv sync
 ```
 
@@ -319,7 +319,7 @@ written into the release files.
 
 ## License
 
-The `smh-to-jsonld` software in this repository is licensed under the
+The `smh-archiver` software in this repository is licensed under the
 [Apache License 2.0](LICENSE). This software license does not relicense the
 Scenario Modeling Hub model outputs, metadata, or auxiliary data. Those
 research objects retain their model- and source-specific terms; Zenodo release
