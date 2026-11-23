@@ -3333,6 +3333,71 @@ def _record_new_version_in_split_manifest(
     return True
 
 
+def _resolve_split_manifest_path(release_dir: Path) -> Path:
+    """Locate the split manifest that tracks a release directory.
+
+    A single-round publish is normally pointed at that one round's own
+    directory (release/zenodo/<round>/), while the manifest tracking every
+    round lives in the parent release root. Look in the given directory first,
+    then one level up, so a round-scoped --release-dir still finds the shared
+    manifest instead of silently skipping it.
+    """
+    release_dir = release_dir.resolve()
+    candidate = release_dir / SPLIT_MANIFEST_NAME
+    if candidate.is_file():
+        return candidate
+    parent_candidate = release_dir.parent / SPLIT_MANIFEST_NAME
+    if parent_candidate.is_file():
+        return parent_candidate
+    return candidate
+
+
+def _mark_published_in_split_manifest(
+    manifest_path: Path,
+    *,
+    api_url: str,
+    deposition_id: int,
+    doi: str | None,
+) -> bool:
+    """Record in a split manifest that a tracked draft became a record.
+
+    Publishing goes through --publish-draft, which is given a deposition id and
+    knows nothing about rounds, so find the round whose draft this was. Without
+    this the manifest goes on describing a published record as an open draft.
+    """
+    if not manifest_path.is_file():
+        return False
+    manifest = load_split_manifest(manifest_path, api_url=api_url)
+    rounds = manifest.get("rounds") or {}
+    round_id = next(
+        (
+            key
+            for key, entry in rounds.items()
+            if isinstance(entry, dict) and entry.get("deposition_id") == deposition_id
+        ),
+        None,
+    )
+    if round_id is None:
+        return False
+    web_url = _web_url_for(api_url)
+    entry = dict(rounds[round_id])
+    entry.pop("draft_url", None)
+    entry.pop("future_record_url", None)
+    entry.update(
+        {
+            "record_id": deposition_id,
+            "record_url": f"{web_url}/records/{deposition_id}",
+            "doi": doi,
+            "status": "published",
+        }
+    )
+    rounds[round_id] = entry
+    manifest["rounds"] = rounds
+    manifest["published_at"] = datetime.now(UTC).isoformat()
+    _write_split_manifest(manifest_path, manifest)
+    return True
+
+
 def assert_record_version_advances(
     client: "ZenodoClient", record_id: int, version: str
 ) -> str:
@@ -3640,6 +3705,12 @@ def main(argv: list[str] | None = None) -> int:
                 timeout=args.timeout,
             )
             result = publish_existing_draft(client, args.publish_draft)
+            result["split_manifest_updated"] = _mark_published_in_split_manifest(
+                _resolve_split_manifest_path(args.release_dir),
+                api_url=args.api_url,
+                deposition_id=args.publish_draft,
+                doi=result.get("doi"),
+            )
         except (OSError, requests.RequestException, ValueError, ZenodoError) as exc:
             print(f"Zenodo release failed: {exc}", file=sys.stderr)
             return 1
@@ -3743,7 +3814,7 @@ def main(argv: list[str] | None = None) -> int:
                 if len(rounds) == 1:
                     result["split_manifest_updated"] = (
                         _record_new_version_in_split_manifest(
-                            args.release_dir.resolve() / SPLIT_MANIFEST_NAME,
+                            _resolve_split_manifest_path(args.release_dir),
                             api_url=args.api_url,
                             round_id=rounds[0],
                             previous_record_id=args.new_version_of,

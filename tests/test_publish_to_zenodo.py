@@ -32,7 +32,9 @@ from publish_to_zenodo import (
     main,
     publish_existing_draft,
     split_release_by_round,
+    _mark_published_in_split_manifest,
     _record_new_version_in_split_manifest,
+    _resolve_split_manifest_path,
     update_draft_metadata_only,
     update_existing_draft,
     upload_release,
@@ -1184,6 +1186,111 @@ def test_recording_a_new_version_repoints_the_split_manifest(tmp_path):
     assert entry["draft_url"] == "https://sandbox.zenodo.org/uploads/632160"
     # Unrelated keys survive so the manifest keeps its other provenance.
     assert entry["default_preview"] == "README.pdf"
+
+
+def _split_manifest(path, **round_fields):
+    """Write a one-round split manifest and return its path."""
+    entry = {
+        "deposition_id": 647740,
+        "status": "draft",
+        "version": "1.0.5",
+        "default_preview": "README.pdf",
+        "draft_url": "https://sandbox.zenodo.org/uploads/647740",
+        "future_record_url": "https://sandbox.zenodo.org/records/647740",
+    }
+    entry.update(round_fields)
+    path.write_text(
+        json.dumps(
+            {
+                "api_url": "https://sandbox.zenodo.org/api",
+                "rounds": {"2023-11-12": entry},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_split_manifest_is_found_from_a_round_scoped_release_dir(tmp_path):
+    # A single-round publish points --release-dir at the round's own directory,
+    # but the manifest tracking every round sits in the release root above it.
+    release_root = tmp_path / "zenodo"
+    round_dir = release_root / "2023-11-12"
+    round_dir.mkdir(parents=True)
+    manifest_path = _split_manifest(release_root / "sandbox-split.json")
+
+    assert _resolve_split_manifest_path(round_dir) == manifest_path
+
+
+def test_split_manifest_in_the_release_dir_takes_precedence(tmp_path):
+    release_root = tmp_path / "zenodo"
+    release_root.mkdir()
+    own = _split_manifest(release_root / "sandbox-split.json")
+    _split_manifest(tmp_path / "sandbox-split.json")
+
+    assert _resolve_split_manifest_path(release_root) == own
+
+
+def test_split_manifest_path_falls_back_to_the_release_dir(tmp_path):
+    release_root = tmp_path / "zenodo"
+    release_root.mkdir()
+
+    assert (
+        _resolve_split_manifest_path(release_root)
+        == release_root / "sandbox-split.json"
+    )
+
+
+def test_publishing_a_draft_marks_its_round_published(tmp_path):
+    manifest_path = _split_manifest(tmp_path / "sandbox-split.json")
+
+    updated = _mark_published_in_split_manifest(
+        manifest_path,
+        api_url="https://sandbox.zenodo.org/api",
+        deposition_id=647740,
+        doi="10.5072/zenodo.647740",
+    )
+
+    assert updated is True
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entry = manifest["rounds"]["2023-11-12"]
+    assert entry["status"] == "published"
+    assert entry["record_id"] == 647740
+    assert entry["record_url"] == "https://sandbox.zenodo.org/records/647740"
+    assert entry["doi"] == "10.5072/zenodo.647740"
+    # Draft-only links go, so nothing points at an upload form that is now gone.
+    assert "draft_url" not in entry
+    assert "future_record_url" not in entry
+    # Unrelated provenance survives, and the run is timestamped.
+    assert entry["default_preview"] == "README.pdf"
+    assert manifest["published_at"]
+
+
+def test_marking_an_untracked_deposition_published_is_a_no_op(tmp_path):
+    manifest_path = _split_manifest(tmp_path / "sandbox-split.json")
+    before = manifest_path.read_text(encoding="utf-8")
+
+    updated = _mark_published_in_split_manifest(
+        manifest_path,
+        api_url="https://sandbox.zenodo.org/api",
+        deposition_id=999999,
+        doi="10.5072/zenodo.999999",
+    )
+
+    assert updated is False
+    assert manifest_path.read_text(encoding="utf-8") == before
+
+
+def test_marking_published_without_a_manifest_is_a_no_op(tmp_path):
+    assert (
+        _mark_published_in_split_manifest(
+            tmp_path / "missing.json",
+            api_url="https://sandbox.zenodo.org/api",
+            deposition_id=647740,
+            doi="10.5072/zenodo.647740",
+        )
+        is False
+    )
 
 
 def test_recording_a_new_version_without_a_manifest_is_a_no_op(tmp_path):
